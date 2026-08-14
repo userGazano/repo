@@ -1,6 +1,4 @@
 import os
-from datetime import datetime
-
 from sqlalchemy import (
     create_engine,
     Column,
@@ -9,74 +7,81 @@ from sqlalchemy import (
     String,
     Float,
     DateTime,
-    Boolean,
-    LargeBinary,
+    Boolean
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime
 
 
 Base = declarative_base()
 
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = 'users'
 
     id = Column(Integer, primary_key=True)
+
+    # Telegram ID может быть больше 2.1 млрд
     telegram_id = Column(BigInteger, unique=True, nullable=False)
+
     username = Column(String)
     balance = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.now)
     is_admin = Column(Boolean, default=False)
 
 
-class Account(Base):
-    __tablename__ = "accounts"
+class Category(Base):
+    __tablename__ = 'categories'
 
     id = Column(Integer, primary_key=True)
-    phone = Column(String, unique=True, nullable=False)
     name = Column(String, nullable=False)
+    emoji = Column(String)
     price = Column(Float, nullable=False)
-    session_data = Column(LargeBinary)
+    created_at = Column(DateTime, default=datetime.now)
 
-    # Telegram ID должен быть BIGINT
-    owner_id = Column(BigInteger)
 
-    sold = Column(Boolean, default=False)
-    sold_at = Column(DateTime)
+class Account(Base):
+    __tablename__ = 'accounts'
 
-    # Telegram ID должен быть BIGINT
+    id = Column(Integer, primary_key=True)
+    category_id = Column(Integer, nullable=False)
+    phone = Column(String, unique=True, nullable=False)
+    available = Column(Boolean, default=True)
+
+    # Telegram ID владельца
     sold_to = Column(BigInteger)
 
     created_at = Column(DateTime, default=datetime.now)
 
 
-class TelethonSession(Base):
-    __tablename__ = "telethon_sessions"
-
-    id = Column(Integer, primary_key=True)
-    phone = Column(String, unique=True, nullable=False)
-    session_string = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
-
-
-class Transaction(Base):
-    __tablename__ = "transactions"
+class UserAccount(Base):
+    __tablename__ = 'user_accounts'
 
     id = Column(Integer, primary_key=True)
 
-    # Здесь тоже храним Telegram ID пользователя
+    # Telegram ID пользователя
     user_id = Column(BigInteger, nullable=False)
 
     account_id = Column(Integer, nullable=False)
+    purchased_at = Column(DateTime, default=datetime.now)
+
+
+class Transaction(Base):
+    __tablename__ = 'transactions'
+
+    id = Column(Integer, primary_key=True)
+
+    # Telegram ID пользователя
+    user_id = Column(BigInteger, nullable=False)
+
+    type = Column(String)
     amount = Column(Float, nullable=False)
-    status = Column(String, default="pending")
+    status = Column(String, default='completed')
     created_at = Column(DateTime, default=datetime.now)
 
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://localhost/shopdb"
-)
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set!")
