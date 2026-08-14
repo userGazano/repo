@@ -1,16 +1,21 @@
+# bot.py — ПОЛНЫЙ КОД С ИНТЕГРАЦИЕЙ ENIVVV
+
 import os
 import logging
 import random
 from pathlib import Path
 from datetime import datetime
-from config import BOT_TOKEN, ADMIN_ID, ADMIN_USERNAME, SHOP_NAME, CURRENCY, TELEGRAM_API_ID, TELEGRAM_API_HASH
+from config import (
+    BOT_TOKEN, ADMIN_ID, ADMIN_USERNAME, SHOP_NAME, CURRENCY,
+    TELEGRAM_API_ID, TELEGRAM_API_HASH
+)
 from database import get_session, User, Category, Account, UserAccount, Transaction
 from telethon_manager import TelethonManager
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
-    CallbackQueryHandler
+    CallbackQueryHandler, ConversationHandler
 )
 
 Path('logs').mkdir(exist_ok=True)
@@ -26,6 +31,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 telethon_mgr = TelethonManager(TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+# Состояния для добавления аккаунта
+(AUTH_PHONE, AUTH_CODE, AUTH_2FA, SELECT_CATEGORY) = range(4)
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
@@ -129,24 +137,25 @@ async def buy_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     account = random.choice(accounts)
     
-    user.balance -= cat.price
-    account.available = False
-    account.sold_to = user_id
+    db = get_session()
+    user_obj = db.query(User).filter_by(telegram_id=user_id).first()
+    user_obj.balance -= cat.price
+    
+    account_obj = db.query(Account).filter_by(id=account.id).first()
+    account_obj.available = False
+    account_obj.sold_to = user_id
     
     user_account = UserAccount(user_id=user_id, account_id=account.id)
     transaction = Transaction(user_id=user_id, type='purchase', amount=cat.price)
     
-    db = get_session()
     db.add(user_account)
     db.add(transaction)
-    user_obj = db.query(User).filter_by(telegram_id=user_id).first()
-    user_obj.balance -= cat.price
     db.commit()
     db.close()
     
     keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data='shop')]]
     await query.edit_message_text(
-        f"✅ <b>Куплено!</b>\n\n{cat.emoji} {cat.name}\n📱 {account.phone}\n\n💰 Баланс: {user.balance}⭐️",
+        f"✅ <b>Куплено!</b>\n\n{cat.emoji} {cat.name}\n📱 {account.phone}\n\n💰 Баланс: {user_obj.balance}⭐️",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
     )
@@ -228,7 +237,7 @@ async def my_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account = db.query(Account).filter_by(id=ua.account_id).first()
         cat = db.query(Category).filter_by(id=account.category_id).first()
         text += f"{cat.emoji} {cat.name}\n📱 {account.phone}\n\n"
-        keyboard.append([InlineKeyboardButton(f"📨 Код: {account.phone}", callback_data=f'get_code_{account.id}')])
+        keyboard.append([InlineKeyboardButton(f"📨 Получить код: {account.phone}", callback_data=f'get_code_{account.id}')])
     db.close()
     
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data='profile')])
@@ -250,9 +259,9 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = telethon_mgr.get_code(account_id)
     
     if code:
-        text = f"✅ <b>КОД:</b>\n\n<code>{code}</code>\n\n⏱️ 10 минут"
+        text = f"✅ <b>КОД:</b>\n\n<code>{code}</code>\n\n⏱️ Действует 10 минут"
     else:
-        text = f"⏳ <b>Ожидание...</b>\n\n📱 {account.phone}\n\nПроверь СМС"
+        text = f"⏳ <b>Ожидание кода...</b>\n\n📱 {account.phone}\n\nПроверьте входящие СМС в Telegram"
     
     keyboard = [
         [InlineKeyboardButton("🔄 Обновить", callback_data=f'get_code_{account_id}')],
@@ -261,7 +270,7 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
-# ==================== ADMIN ====================
+# ==================== ADMIN HANDLERS ====================
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -278,14 +287,140 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("⚙️ <b>Админ</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
-async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        return
+        await update.callback_query.answer("❌ Доступ запрещён", show_alert=True)
+        return ConversationHandler.END
     
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📱 Отправь номер: +79991234567")
-    context.user_data['mode'] = 'request_code'
+    await query.edit_message_text(
+        "📱 <b>Введи номер телефона</b>\n\nПример: +79991234567",
+        parse_mode='HTML'
+    )
+    return AUTH_PHONE
+
+async def admin_receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    
+    phone = update.message.text.strip()
+    
+    if not phone.startswith('+') or len(phone) < 10:
+        await update.message.reply_text("❌ Неверный формат. Попробуй: +79991234567")
+        return AUTH_PHONE
+    
+    context.user_data['phone'] = phone
+    context.user_data['account_id'] = hash(phone) % 1000000
+    
+    await update.message.reply_text("⏳ Отправляю код...")
+    success, message = await telethon_mgr.request_code(phone, context.user_data['account_id'])
+    
+    if success:
+        await update.message.reply_text(f"✅ {message}\n\n📝 Введи 5-значный код", parse_mode='HTML')
+        return AUTH_CODE
+    else:
+        await update.message.reply_text(f"❌ {message}")
+        return ConversationHandler.END
+
+async def admin_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    
+    code = update.message.text.strip()
+    
+    if not code.isdigit() or len(code) != 5:
+        await update.message.reply_text("❌ Код должен быть 5 цифр")
+        return AUTH_CODE
+    
+    phone = context.user_data['phone']
+    
+    await update.message.reply_text("⏳ Проверяю...")
+    success, message = await telethon_mgr.verify_code(phone, code)
+    
+    if success:
+        await update.message.reply_text(f"✅ {message}\n\n📂 Выбери категорию", parse_mode='HTML')
+        db = get_session()
+        categories = db.query(Category).all()
+        db.close()
+        
+        keyboard = []
+        for cat in categories:
+            keyboard.append([InlineKeyboardButton(f"{cat.emoji} {cat.name} ({cat.price}⭐️)", callback_data=f'admin_cat_{cat.id}')])
+        
+        await update.message.reply_text(
+            "📂 <b>Выбери категорию:</b>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        return SELECT_CATEGORY
+    elif message == "2FA_REQUIRED":
+        await update.message.reply_text("🔐 Введи пароль 2FA:", parse_mode='HTML')
+        return AUTH_2FA
+    else:
+        await update.message.reply_text(f"❌ {message}")
+        return ConversationHandler.END
+
+async def admin_receive_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    
+    password = update.message.text.strip()
+    phone = context.user_data['phone']
+    
+    await update.message.reply_text("⏳ Проверяю...")
+    success, message = await telethon_mgr.verify_2fa(phone, password)
+    
+    if success:
+        await update.message.reply_text(f"✅ {message}\n\n📂 Выбери категорию", parse_mode='HTML')
+        db = get_session()
+        categories = db.query(Category).all()
+        db.close()
+        
+        keyboard = []
+        for cat in categories:
+            keyboard.append([InlineKeyboardButton(f"{cat.emoji} {cat.name} ({cat.price}⭐️)", callback_data=f'admin_cat_{cat.id}')])
+        
+        await update.message.reply_text(
+            "📂 <b>Выбери категорию:</b>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        return SELECT_CATEGORY
+    else:
+        await update.message.reply_text(f"❌ {message}")
+        return ConversationHandler.END
+
+async def admin_select_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    
+    query = update.callback_query
+    await query.answer()
+    
+    category_id = int(query.data.split('_')[2])
+    phone = context.user_data['phone']
+    account_id = context.user_data['account_id']
+    
+    db = get_session()
+    cat = db.query(Category).filter_by(id=category_id).first()
+    
+    if not cat:
+        await query.edit_message_text("❌ Категория не найдена")
+        db.close()
+        return ConversationHandler.END
+    
+    account = Account(category_id=category_id, phone=phone)
+    db.add(account)
+    db.commit()
+    db.close()
+    
+    await query.edit_message_text(
+        f"✅ <b>Аккаунт добавлен!</b>\n\n{cat.emoji} {cat.name}\n📱 {phone}\n\n📡 Слушаю входящие коды...",
+        parse_mode='HTML'
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def admin_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -302,9 +437,11 @@ async def admin_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     
     if categories:
+        db = get_session()
         for cat in categories:
             accounts_count = db.query(Account).filter_by(category_id=cat.id, available=True).count()
             text += f"{cat.emoji} {cat.name} - {cat.price}⭐️ ({accounts_count} акк)\n"
+        db.close()
     
     keyboard.append([InlineKeyboardButton("➕ Новая категория", callback_data='admin_new_cat')])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data='admin_back')])
@@ -349,10 +486,14 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     accounts = db.query(Account).all()
     db.close()
     
+    if not accounts:
+        await query.edit_message_text("📭 Нет аккаунтов")
+        return
+    
     text = "📋 <b>Все аккаунты:</b>\n\n"
     for acc in accounts:
-        status = "✅" if not acc.available else "🟢"
-        text += f"{status} {acc.phone}\n"
+        status = "✅ ПРОДАН" if not acc.available else "🟢 ДОСТУПЕН"
+        text += f"{status} - {acc.phone}\n"
     
     await query.edit_message_text(text, parse_mode='HTML')
 
@@ -363,82 +504,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get('mode')
     text = update.message.text
     
-    if mode == 'request_code':
-        try:
-            phone = text.strip()
-            account_id = hash(phone) % 1000000
-            success, message = await telethon_mgr.request_code(phone, account_id)
-            
-            if success:
-                await update.message.reply_text(f"✅ Код отправлен\n\n📝 Отправь код")
-                context.user_data['pending_phone'] = phone
-                context.user_data['pending_account_id'] = account_id
-                context.user_data['mode'] = 'verify_code'
-            else:
-                await update.message.reply_text(f"❌ {message}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
-    
-    elif mode == 'verify_code':
-        try:
-            phone = context.user_data.get('pending_phone')
-            
-            if text.lower() == '2fa':
-                await update.message.reply_text("🔐 Пароль 2FA:")
-                context.user_data['mode'] = 'verify_2fa'
-                return
-            
-            success, message = await telethon_mgr.verify_code(phone, text)
-            
-            if success:
-                await update.message.reply_text(f"✅ Верно\n\n📂 Отправь категорию\nПример: 1")
-                context.user_data['mode'] = 'select_category'
-                context.user_data['verified_phone'] = phone
-            elif message == "2FA_REQUIRED":
-                await update.message.reply_text("🔐 Пароль 2FA:")
-                context.user_data['mode'] = 'verify_2fa'
-            else:
-                await update.message.reply_text(f"❌ {message}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
-    
-    elif mode == 'verify_2fa':
-        try:
-            phone = context.user_data.get('pending_phone')
-            success, message = await telethon_mgr.verify_2fa(phone, text)
-            
-            if success:
-                await update.message.reply_text(f"✅ ОК\n\n📂 Категория ID:")
-                context.user_data['mode'] = 'select_category'
-                context.user_data['verified_phone'] = phone
-            else:
-                await update.message.reply_text(f"❌ {message}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
-    
-    elif mode == 'select_category':
-        try:
-            category_id = int(text)
-            phone = context.user_data.get('verified_phone')
-            
-            db = get_session()
-            cat = db.query(Category).filter_by(id=category_id).first()
-            if not cat:
-                await update.message.reply_text("❌ Категория не найдена")
-                db.close()
-                return
-            
-            account = Account(category_id=category_id, phone=phone)
-            db.add(account)
-            db.commit()
-            db.close()
-            
-            await update.message.reply_text(f"✅ Добавлено\n\n{cat.emoji} {cat.name}\n📱 {phone}")
-            context.user_data['mode'] = None
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
-    
-    elif mode == 'new_category':
+    if mode == 'new_category':
         try:
             parts = text.split()
             emoji = parts[0]
@@ -467,9 +533,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user:
                 user.balance += amount
                 db.commit()
-                await update.message.reply_text(f"✅ +{amount}⭐️")
+                await update.message.reply_text(f"✅ +{amount}⭐️ пользователю {user_id}")
             else:
-                await update.message.reply_text("❌ Не найден")
+                await update.message.reply_text("❌ Пользователь не найден")
             db.close()
             context.user_data['mode'] = None
         except Exception as e:
@@ -484,7 +550,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db = get_session()
             account = db.query(Account).filter_by(category_id=category_id, available=True).first()
             if not account:
-                await update.message.reply_text("❌ Нет доступных")
+                await update.message.reply_text("❌ Нет доступных аккаунтов в этой категории")
                 db.close()
                 return
             
@@ -495,7 +561,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.commit()
             db.close()
             
-            await update.message.reply_text(f"✅ Выдано\n\n📱 {account.phone}")
+            await update.message.reply_text(f"✅ Аккаунт выдан\n\n📱 {account.phone}")
             context.user_data['mode'] = None
         except Exception as e:
             await update.message.reply_text(f"❌ {e}")
@@ -528,6 +594,19 @@ def main():
     logger.info("🚀 Starting bot...")
     app = Application.builder().token(BOT_TOKEN).build()
     
+    # Conversation handler для добавления аккаунта админом
+    add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_add_start, pattern='admin_add')],
+        states={
+            AUTH_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_phone)],
+            AUTH_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_code)],
+            AUTH_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_2fa)],
+            SELECT_CATEGORY: [CallbackQueryHandler(admin_select_category, pattern='admin_cat_')],
+        },
+        fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
+    )
+    
+    # Handlers
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('admin', admin))
     
@@ -540,7 +619,7 @@ def main():
     app.add_handler(CallbackQueryHandler(my_accounts, pattern='my_accounts'))
     app.add_handler(CallbackQueryHandler(get_code, pattern='get_code_'))
     
-    app.add_handler(CallbackQueryHandler(admin_add, pattern='admin_add'))
+    app.add_handler(add_conv)
     app.add_handler(CallbackQueryHandler(admin_categories, pattern='admin_categories'))
     app.add_handler(CallbackQueryHandler(admin_new_cat, pattern='admin_new_cat'))
     app.add_handler(CallbackQueryHandler(admin_balance, pattern='admin_balance'))
