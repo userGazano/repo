@@ -1,14 +1,16 @@
 import os
 import logging
+import asyncio
 from pathlib import Path
 from datetime import datetime
-from config import BOT_TOKEN, ADMIN_ID, ADMIN_USERNAME, SHOP_NAME, CURRENCY
+from config import BOT_TOKEN, ADMIN_ID, ADMIN_USERNAME, SHOP_NAME, CURRENCY, TELEGRAM_API_ID, TELEGRAM_API_HASH
 from database import get_session, User, Account, Transaction
+from telethon_manager import TelethonManager
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
-    CallbackQueryHandler
+    CallbackQueryHandler, ConversationHandler
 )
 
 Path('logs').mkdir(exist_ok=True)
@@ -23,8 +25,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+telethon_mgr = TelethonManager(TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+(AUTH_PHONE, AUTH_CODE, AUTH_2FA, ACCOUNT_NAME) = range(4)
+
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+# ==================== USER HANDLERS ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -135,6 +143,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data='back')]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
+# ==================== ADMIN HANDLERS ====================
+
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Доступ запрещён")
@@ -143,10 +153,11 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить аккаунт", callback_data='admin_add')],
         [InlineKeyboardButton("💰 Выдать баланс", callback_data='admin_balance')],
-        [InlineKeyboardButton("📋 Аккаунты", callback_data='admin_list')]
+        [InlineKeyboardButton("📋 Все аккаунты", callback_data='admin_list')],
+        [InlineKeyboardButton("🔐 Запросить код", callback_data='admin_request_code')]
     ]
     
-    await update.message.reply_text("⚙️ <b>Админ</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await update.message.reply_text("⚙️ <b>Админ-панель</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -154,7 +165,7 @@ async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Отправь: ИМЯ | ТЕЛЕФОН | ЦЕНА\nПример: VIP | +79991234567 | 5000")
+    await query.edit_message_text("📝 Отправь: ИМЯ | ТЕЛЕФОН | ЦЕНА\nПример: VIP | +79991234567 | 5000")
     context.user_data['mode'] = 'add_account'
 
 async def admin_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,7 +174,7 @@ async def admin_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Отправь: USER_ID СУММА\nПример: 123456789 5000")
+    await query.edit_message_text("💰 Отправь: USER_ID СУММА\nПример: 123456789 5000")
     context.user_data['mode'] = 'give_balance'
 
 async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -181,12 +192,21 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📭 Нет аккаунтов")
         return
     
-    text = "📋 <b>Аккаунты:</b>\n\n"
+    text = "📋 <b>Все аккаунты:</b>\n\n"
     for acc in accounts:
-        status = "✅" if acc.sold else "🟢"
-        text += f"{status} {acc.name} | {acc.phone} | {acc.price}{CURRENCY}\n"
+        status = "✅ ПРОДАН" if acc.sold else "🟢 ДОСТУПЕН"
+        text += f"{status} | {acc.name} | {acc.phone} | {acc.price}{CURRENCY}\n"
     
     await query.edit_message_text(text, parse_mode='HTML')
+
+async def admin_request_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📱 Отправь номер телефона: +79991234567")
+    context.user_data['mode'] = 'request_code'
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -224,10 +244,88 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user:
                 user.balance += amount
                 db.commit()
-                await update.message.reply_text(f"✅ +{amount}{CURRENCY}")
+                await update.message.reply_text(f"✅ +{amount}{CURRENCY} выдано")
             else:
-                await update.message.reply_text("❌ Не найден")
+                await update.message.reply_text("❌ Юзер не найден")
             db.close()
+            context.user_data['mode'] = None
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+    
+    elif mode == 'request_code':
+        try:
+            phone = text.strip()
+            if not phone.startswith('+'):
+                await update.message.reply_text("❌ Формат: +7XXXXXXXXXX")
+                return
+            
+            account_id = hash(phone) % 1000000
+            success, message = await telethon_mgr.request_code(phone, account_id)
+            
+            if success:
+                await update.message.reply_text(f"✅ {message}\n\n📝 Отправь код или напиши '2fa' если нужна двухфакторка")
+                context.user_data['pending_phone'] = phone
+                context.user_data['pending_account_id'] = account_id
+                context.user_data['mode'] = 'verify_code'
+            else:
+                await update.message.reply_text(f"❌ {message}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+    
+    elif mode == 'verify_code':
+        try:
+            phone = context.user_data.get('pending_phone')
+            account_id = context.user_data.get('pending_account_id')
+            
+            if text.lower() == '2fa':
+                await update.message.reply_text("🔐 Отправь пароль 2FA")
+                context.user_data['mode'] = 'verify_2fa'
+                return
+            
+            if not text.isdigit() or len(text) != 5:
+                await update.message.reply_text("❌ Код должен быть 5 цифр")
+                return
+            
+            success, message = await telethon_mgr.verify_code(phone, text)
+            
+            if success:
+                await update.message.reply_text(f"✅ {message}\n\n📝 Отправь имя для аккаунта")
+                context.user_data['mode'] = 'account_name'
+                context.user_data['verified_phone'] = phone
+            elif message == "2FA_REQUIRED":
+                await update.message.reply_text("🔐 Отправь пароль 2FA")
+                context.user_data['mode'] = 'verify_2fa'
+            else:
+                await update.message.reply_text(f"❌ {message}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+    
+    elif mode == 'verify_2fa':
+        try:
+            phone = context.user_data.get('pending_phone')
+            success, message = await telethon_mgr.verify_2fa(phone, text)
+            
+            if success:
+                await update.message.reply_text(f"✅ {message}\n\n📝 Отправь имя для аккаунта")
+                context.user_data['mode'] = 'account_name'
+                context.user_data['verified_phone'] = phone
+            else:
+                await update.message.reply_text(f"❌ {message}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+    
+    elif mode == 'account_name':
+        try:
+            name = text.strip()
+            phone = context.user_data.get('verified_phone')
+            
+            db = get_session()
+            account = Account(name=name, phone=phone, price=0, owner_id=ADMIN_ID)
+            db.add(account)
+            db.commit()
+            db.close()
+            
+            await update.message.reply_text(f"✅ Аккаунт добавлен: {name}\n📱 {phone}\n📡 Слушаю коды...")
             context.user_data['mode'] = None
         except Exception as e:
             await update.message.reply_text(f"❌ {e}")
@@ -261,6 +359,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_add, pattern='admin_add'))
     app.add_handler(CallbackQueryHandler(admin_balance, pattern='admin_balance'))
     app.add_handler(CallbackQueryHandler(admin_list, pattern='admin_list'))
+    app.add_handler(CallbackQueryHandler(admin_request_code, pattern='admin_request_code'))
     app.add_handler(CallbackQueryHandler(back, pattern='back'))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
