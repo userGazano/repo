@@ -1,17 +1,17 @@
-import os
 import logging
+import re
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
-from datetime import datetime, timedelta
-import re
-from config import TELEGRAM_API_ID, TELEGRAM_API_HASH
-from database import get_session, TelethonSession, Account
+from database import get_session, TelethonSession
 
 logger = logging.getLogger(__name__)
 
 class TelethonManager:
-    def __init__(self):
+    def __init__(self, api_id: int, api_hash: str):
+        self.api_id = api_id
+        self.api_hash = api_hash
         self.clients = {}
         self.pending_auth = {}
         self.captured_codes = {}
@@ -20,23 +20,19 @@ class TelethonManager:
         try:
             logger.info(f"🔐 Requesting code for {phone}")
             
-            # Восстанавливаем сессию из БД если есть
             db = get_session()
             session_record = db.query(TelethonSession).filter_by(phone=phone).first()
             
-            if session_record:
-                session_string = session_record.session_string
-            else:
-                session_string = f"session_{phone.replace('+', '')}"
+            session_string = f"session_{phone.replace('+', '')}"
             
-            client = TelegramClient(session_string, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+            client = TelegramClient(session_string, self.api_id, self.api_hash)
             await client.connect()
             
             if await client.is_user_authorized():
                 logger.info(f"✅ Already authorized")
                 self.clients[account_id] = client
                 self.captured_codes[account_id] = {'code': None, 'expires_at': None}
-                self._start_listening(account_id, client)
+                await self._start_listening(account_id, client)
                 db.close()
                 return True, "Already authorized"
             
@@ -76,7 +72,6 @@ class TelethonManager:
             
             me = await client.get_me()
             
-            # Сохраняем сессию в БД
             db = get_session()
             session_record = db.query(TelethonSession).filter_by(phone=phone).first()
             if not session_record:
@@ -88,7 +83,7 @@ class TelethonManager:
             self.clients[account_id] = client
             del self.pending_auth[phone]
             self.captured_codes[account_id] = {'code': None, 'expires_at': None}
-            self._start_listening(account_id, client)
+            await self._start_listening(account_id, client)
             
             return True, f"{me.first_name}"
             
@@ -121,7 +116,7 @@ class TelethonManager:
             self.clients[account_id] = client
             del self.pending_auth[phone]
             self.captured_codes[account_id] = {'code': None, 'expires_at': None}
-            self._start_listening(account_id, client)
+            await self._start_listening(account_id, client)
             
             return True, "2FA OK"
             
@@ -129,7 +124,7 @@ class TelethonManager:
             logger.error(f"2FA error: {e}")
             return False, str(e)
     
-    def _start_listening(self, account_id: int, client: TelegramClient):
+    async def _start_listening(self, account_id: int, client: TelegramClient):
         @client.on(events.NewMessage(incoming=True))
         async def on_message(event):
             try:
@@ -147,13 +142,14 @@ class TelethonManager:
             except Exception as e:
                 logger.error(f"Error: {e}")
         
-        logger.info(f"📡 Listening {account_id}")
+        logger.info(f"📡 Listening on account {account_id}")
     
     def _extract_code(self, text: str) -> Optional[str]:
         patterns = [
             r'(?:код|code)[\s:]*(\d{5})',
             r'(\d{5})\s+is\s+your',
             r'telegram[\s:]*(\d{5})',
+            r'^(\d{5})$',
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
@@ -179,5 +175,3 @@ class TelethonManager:
         if account_id in self.clients:
             await self.clients[account_id].disconnect()
             del self.clients[account_id]
-
-telethon_mgr = TelethonManager()
