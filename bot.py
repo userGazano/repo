@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 from pathlib import Path
 from datetime import datetime
 from config import BOT_TOKEN, ADMIN_ID, ADMIN_USERNAME, SHOP_NAME, CURRENCY, TELEGRAM_API_ID, TELEGRAM_API_HASH
@@ -10,7 +9,7 @@ from telethon_manager import TelethonManager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
-    CallbackQueryHandler, ConversationHandler
+    CallbackQueryHandler
 )
 
 Path('logs').mkdir(exist_ok=True)
@@ -26,8 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 telethon_mgr = TelethonManager(TELEGRAM_API_ID, TELEGRAM_API_HASH)
-
-(AUTH_PHONE, AUTH_CODE, AUTH_2FA, ACCOUNT_NAME) = range(4)
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
@@ -133,14 +130,71 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     accounts = db.query(Account).filter_by(sold_to=query.from_user.id).all()
     db.close()
     
-    text = f"👤 <b>Профиль</b>\n💰 {user.balance}{CURRENCY}\n📱 Аккаунтов: {len(accounts)}\n"
+    text = (
+        f"👤 <b>Профиль @{user.username or 'unknown'}</b>\n\n"
+        f"🆔 ID: {user.telegram_id}\n"
+        f"💰 Баланс: {user.balance}{CURRENCY}\n"
+        f"📅 Дата регистрации: {user.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        f"✅ Активен\n"
+        f"👤 Пользователь"
+    )
     
+    keyboard = []
     if accounts:
-        text += "\n<b>Мои аккаунты:</b>\n"
-        for acc in accounts:
-            text += f"📱 {acc.name} — {acc.phone}\n"
+        keyboard.append([InlineKeyboardButton("📱 Мои аккаунты", callback_data='my_accounts')])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data='back')])
     
-    keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data='back')]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def my_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    db = get_session()
+    accounts = db.query(Account).filter_by(sold_to=query.from_user.id).all()
+    db.close()
+    
+    if not accounts:
+        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data='profile')]]
+        await query.edit_message_text("📭 Нет аккаунтов", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    text = f"📱 <b>Мои аккаунты</b>\n\n"
+    keyboard = []
+    
+    for acc in accounts:
+        text += f"📱 {acc.name}\n📱 {acc.phone}\n\n"
+        keyboard.append([InlineKeyboardButton(f"📨 Получить код: {acc.name}", callback_data=f'get_code_{acc.id}')])
+    
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data='profile')])
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    account_id = int(query.data.split('_')[2])
+    db = get_session()
+    account = db.query(Account).filter_by(id=account_id).first()
+    db.close()
+    
+    if not account:
+        await query.edit_message_text("❌ Аккаунт не найден")
+        return
+    
+    code = telethon_mgr.get_code(account_id)
+    
+    if code:
+        text = f"✅ <b>КОД:</b>\n\n<code>{code}</code>\n\n⏱️ Действителен 10 минут"
+    else:
+        text = f"⏳ <b>Ожидание кода...</b>\n\n📱 Номер: {account.phone}\n\nПроверь входящие СМС"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f'get_code_{account_id}')],
+        [InlineKeyboardButton("◀️ Назад", callback_data='my_accounts')]
+    ]
+    
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 # ==================== ADMIN HANDLERS ====================
@@ -194,8 +248,8 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = "📋 <b>Все аккаунты:</b>\n\n"
     for acc in accounts:
-        status = "✅ ПРОДАН" if acc.sold else "🟢 ДОСТУПЕН"
-        text += f"{status} | {acc.name} | {acc.phone} | {acc.price}{CURRENCY}\n"
+        status = "✅" if acc.sold else "🟢"
+        text += f"{status} {acc.name} | {acc.phone} | {acc.price}{CURRENCY}\n"
     
     await query.edit_message_text(text, parse_mode='HTML')
 
@@ -263,7 +317,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success, message = await telethon_mgr.request_code(phone, account_id)
             
             if success:
-                await update.message.reply_text(f"✅ {message}\n\n📝 Отправь код или напиши '2fa' если нужна двухфакторка")
+                await update.message.reply_text(f"✅ {message}\n\n📝 Отправь код")
                 context.user_data['pending_phone'] = phone
                 context.user_data['pending_account_id'] = account_id
                 context.user_data['mode'] = 'verify_code'
@@ -355,6 +409,8 @@ def main():
     
     app.add_handler(CallbackQueryHandler(shop, pattern='shop'))
     app.add_handler(CallbackQueryHandler(profile, pattern='profile'))
+    app.add_handler(CallbackQueryHandler(my_accounts, pattern='my_accounts'))
+    app.add_handler(CallbackQueryHandler(get_code, pattern='get_code_'))
     app.add_handler(CallbackQueryHandler(buy, pattern='buy_'))
     app.add_handler(CallbackQueryHandler(admin_add, pattern='admin_add'))
     app.add_handler(CallbackQueryHandler(admin_balance, pattern='admin_balance'))
