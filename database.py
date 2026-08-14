@@ -1,14 +1,25 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, DateTime, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
+
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    BigInteger,
+    String,
+    Float,
+    DateTime,
+    Boolean,
+    LargeBinary,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
 
 Base = declarative_base()
 
 
 class User(Base):
-    __tablename__ = 'users'
+    __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
     telegram_id = Column(BigInteger, unique=True, nullable=False)
@@ -19,21 +30,28 @@ class User(Base):
 
 
 class Account(Base):
-    __tablename__ = 'accounts'
+    __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True)
     phone = Column(String, unique=True, nullable=False)
     name = Column(String, nullable=False)
     price = Column(Float, nullable=False)
-    owner_id = Column(Integer)
+    session_data = Column(LargeBinary)
+
+    # Telegram ID должен быть BIGINT
+    owner_id = Column(BigInteger)
+
     sold = Column(Boolean, default=False)
     sold_at = Column(DateTime)
-    sold_to = Column(Integer)
+
+    # Telegram ID должен быть BIGINT
+    sold_to = Column(BigInteger)
+
     created_at = Column(DateTime, default=datetime.now)
 
 
 class TelethonSession(Base):
-    __tablename__ = 'telethon_sessions'
+    __tablename__ = "telethon_sessions"
 
     id = Column(Integer, primary_key=True)
     phone = Column(String, unique=True, nullable=False)
@@ -42,23 +60,27 @@ class TelethonSession(Base):
 
 
 class Transaction(Base):
-    __tablename__ = 'transactions'
+    __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, nullable=False)
+
+    # Здесь тоже храним Telegram ID пользователя
+    user_id = Column(BigInteger, nullable=False)
+
     account_id = Column(Integer, nullable=False)
     amount = Column(Float, nullable=False)
-    status = Column(String, default='pending')
+    status = Column(String, default="pending")
     created_at = Column(DateTime, default=datetime.now)
 
 
 DATABASE_URL = os.getenv(
-    'DATABASE_URL',
-    'postgresql://localhost/shopdb'
+    "DATABASE_URL",
+    "postgresql://localhost/shopdb"
 )
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL not set!")
+
 
 engine = create_engine(
     DATABASE_URL,
